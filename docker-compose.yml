@@ -1,0 +1,80 @@
+version: '3.9'
+
+services:
+  btc-postgres:
+    image: postgres:16-alpine
+    container_name: btc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: btc_futures_ai_lab
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d btc_futures_ai_lab"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  btc-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: btc-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      SERVER_PORT: ${SERVER_PORT:-8080}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@btc-postgres:5432/btc_futures_ai_lab}
+      OKX_INSTRUMENT: ${OKX_INSTRUMENT:-BTC-USDT-SWAP}
+      OKX_REST_URL: ${OKX_REST_URL:-https://www.okx.com}
+      OKX_WS_PUBLIC: ${OKX_WS_PUBLIC:-wss://ws.okx.com/ws/v5/public}
+      OKX_WS_BUSINESS: ${OKX_WS_BUSINESS:-wss://ws.okx.com/ws/v5/business}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      GEMINI_API_MODE: ${GEMINI_API_MODE:-interactions}
+      ANALYSIS_TIMEFRAME: ${ANALYSIS_TIMEFRAME:-15m}
+      AUTO_ANALYZE: ${AUTO_ANALYZE:-false}
+      AUTO_PAPER_TRADING: ${AUTO_PAPER_TRADING:-false}
+      PAPER_TRADING_ONLY: ${PAPER_TRADING_ONLY:-true}
+      DEFAULT_RISK_PER_TRADE: ${DEFAULT_RISK_PER_TRADE:-0.01}
+      MAX_LEVERAGE: ${MAX_LEVERAGE:-20}
+      MAX_DAILY_LOSS_PERCENT: ${MAX_DAILY_LOSS_PERCENT:-0.05}
+      TIMEZONE: ${TIMEZONE:-Asia/Ho_Chi_Minh}
+    depends_on:
+      btc-postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  btc-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: btc-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: http://btc-backend:8080
+    depends_on:
+      btc-backend:
+        condition: service_started
+    ports:
+      - "5173:5173"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5173"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
