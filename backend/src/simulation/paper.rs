@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,12 +11,14 @@ pub struct PaperOrderRequest {
     pub take_profit: f64,
     pub margin_amount: f64,
     pub leverage: i32,
+    pub max_loss_percent: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaperSettingsRequest {
     pub margin_per_order: f64,
     pub leverage: i32,
+    pub max_loss_percent: f64,
     pub auto_trade_enabled: bool,
 }
 
@@ -24,8 +26,8 @@ pub struct PaperSettingsRequest {
 pub struct PaperTradingSettings {
     pub margin_per_order: f64,
     pub leverage: i32,
+    pub max_loss_percent: f64,
     pub auto_trade_enabled: bool,
-    pub scan_interval_minutes: u64,
     pub allow_multiple_positions: bool,
 }
 
@@ -34,8 +36,8 @@ impl Default for PaperTradingSettings {
         Self {
             margin_per_order: 100.0,
             leverage: 10,
+            max_loss_percent: 5.0,
             auto_trade_enabled: false,
-            scan_interval_minutes: 15,
             allow_multiple_positions: true,
         }
     }
@@ -49,6 +51,7 @@ pub struct PaperPosition {
     pub current_price: f64,
     pub stop_loss: f64,
     pub take_profit: f64,
+    pub max_loss_price: f64,
     pub quantity: f64,
     pub leverage: i32,
     pub margin: f64,
@@ -81,8 +84,8 @@ pub struct PaperAccountSummary {
     pub margin_per_order: f64,
     pub leverage: i32,
     pub max_leverage: i32,
+    pub max_loss_percent: f64,
     pub auto_trade_enabled: bool,
-    pub scan_interval_minutes: u64,
     pub allow_multiple_positions: bool,
 }
 
@@ -137,8 +140,8 @@ impl PaperSimulation {
             margin_per_order: self.settings.margin_per_order,
             leverage: self.settings.leverage,
             max_leverage,
+            max_loss_percent: self.settings.max_loss_percent,
             auto_trade_enabled: self.settings.auto_trade_enabled,
-            scan_interval_minutes: self.settings.scan_interval_minutes,
             allow_multiple_positions: self.settings.allow_multiple_positions,
         }
     }
@@ -158,6 +161,11 @@ impl PaperSimulation {
         if !(1..=max_leverage).contains(&request.leverage) {
             anyhow::bail!("Đòn bẩy phải nằm trong khoảng 1 đến {max_leverage}x.");
         }
+        if !request.max_loss_percent.is_finite()
+            || !(0.1..=100.0).contains(&request.max_loss_percent)
+        {
+            anyhow::bail!("Mức lỗ tối đa phải nằm trong khoảng 0,1% đến 100% ký quỹ.");
+        }
         if request.margin_per_order > self.initial_balance {
             anyhow::bail!("Số tiền ký quỹ mỗi lệnh vượt quá vốn tài khoản mô phỏng.");
         }
@@ -172,20 +180,25 @@ impl PaperSimulation {
         }
         self.settings.margin_per_order = request.margin_per_order;
         self.settings.leverage = request.leverage;
+        self.settings.max_loss_percent = request.max_loss_percent;
         self.settings.auto_trade_enabled = request.auto_trade_enabled;
         Ok(())
     }
 
-    pub fn auto_scan_due(&mut self) -> bool {
+    pub fn auto_scan_due(&mut self, timeframe_seconds: i64) -> bool {
         if !self.settings.auto_trade_enabled {
+            return false;
+        }
+        if timeframe_seconds <= 0 {
             return false;
         }
         let now = Utc::now();
         if self.next_auto_scan_at.is_some_and(|next| next > now) {
             return false;
         }
-        self.next_auto_scan_at =
-            Some(now + Duration::minutes(self.settings.scan_interval_minutes as i64));
+        let next_boundary = (now.timestamp().div_euclid(timeframe_seconds) + 1)
+            * timeframe_seconds;
+        self.next_auto_scan_at = DateTime::from_timestamp(next_boundary, 0);
         true
     }
 
@@ -239,6 +252,11 @@ impl PaperSimulation {
         if !(1..=max_leverage).contains(&request.leverage) {
             anyhow::bail!("Đòn bẩy phải nằm trong khoảng 1 đến {max_leverage}x.");
         }
+        if !request.max_loss_percent.is_finite()
+            || !(0.1..=100.0).contains(&request.max_loss_percent)
+        {
+            anyhow::bail!("Mức lỗ tối đa phải nằm trong khoảng 0,1% đến 100% ký quỹ.");
+        }
 
         let margin = request.margin_amount;
         let available_balance = self.summary(max_leverage).available_balance;
@@ -249,14 +267,26 @@ impl PaperSimulation {
         if !quantity.is_finite() || quantity <= 0.0 {
             anyhow::bail!("Không thể tính khối lượng vị thế từ số tiền và đòn bẩy.");
         }
+        let max_loss_price_delta = margin * request.max_loss_percent / 100.0 / quantity;
+        let max_loss_price = match request.direction.as_str() {
+            "LONG" => entry_price - max_loss_price_delta,
+            "SHORT" => entry_price + max_loss_price_delta,
+            _ => unreachable!(),
+        };
+        let stop_loss = match request.direction.as_str() {
+            "LONG" => request.stop_loss.max(max_loss_price),
+            "SHORT" => request.stop_loss.min(max_loss_price),
+            _ => unreachable!(),
+        };
 
         let position = PaperPosition {
             id: Uuid::new_v4().to_string(),
             direction: request.direction,
             entry_price,
             current_price: entry_price,
-            stop_loss: request.stop_loss,
+            stop_loss,
             take_profit: request.take_profit,
+            max_loss_price,
             quantity,
             leverage: request.leverage,
             margin,
@@ -271,11 +301,25 @@ impl PaperSimulation {
         let mut remaining = Vec::with_capacity(self.positions.len());
         for mut position in self.positions.drain(..) {
             let close = match position.direction.as_str() {
-                "LONG" if price <= position.stop_loss => Some((position.stop_loss, "STOP_LOSS")),
+                "LONG" if price <= position.stop_loss => Some((
+                    position.stop_loss,
+                    if position.stop_loss == position.max_loss_price {
+                        "MAX_LOSS"
+                    } else {
+                        "STOP_LOSS"
+                    },
+                )),
                 "LONG" if price >= position.take_profit => {
                     Some((position.take_profit, "TAKE_PROFIT"))
                 }
-                "SHORT" if price >= position.stop_loss => Some((position.stop_loss, "STOP_LOSS")),
+                "SHORT" if price >= position.stop_loss => Some((
+                    position.stop_loss,
+                    if position.stop_loss == position.max_loss_price {
+                        "MAX_LOSS"
+                    } else {
+                        "STOP_LOSS"
+                    },
+                )),
                 "SHORT" if price <= position.take_profit => {
                     Some((position.take_profit, "TAKE_PROFIT"))
                 }
@@ -354,6 +398,7 @@ mod tests {
             take_profit,
             margin_amount: 100.0,
             leverage: 10,
+            max_loss_percent: 5.0,
         }
     }
 
@@ -370,6 +415,21 @@ mod tests {
         assert!(simulation.positions().is_empty());
         assert_eq!(simulation.trades()[0].close_reason, "TAKE_PROFIT");
         assert_eq!(simulation.summary(20).realized_pnl, 200.0);
+    }
+
+    #[test]
+    fn closes_position_at_max_loss_percentage_of_margin() {
+        let mut simulation = PaperSimulation::default();
+        let position = simulation
+            .open_position(order("LONG", 90.0, 120.0), 100.0, 20)
+            .unwrap();
+
+        assert_eq!(position.stop_loss, 99.5);
+        simulation.update_price(99.0);
+
+        assert!(simulation.positions().is_empty());
+        assert_eq!(simulation.trades()[0].close_reason, "MAX_LOSS");
+        assert_eq!(simulation.trades()[0].pnl, -5.0);
     }
 
     #[test]
@@ -390,17 +450,19 @@ mod tests {
                 PaperSettingsRequest {
                     margin_per_order: 250.0,
                     leverage: 15,
+                    max_loss_percent: 5.0,
                     auto_trade_enabled: true,
                 },
                 20,
             )
             .unwrap();
 
-        assert!(simulation.auto_scan_due());
-        assert!(!simulation.auto_scan_due());
+        assert!(simulation.auto_scan_due(15 * 60));
+        assert!(!simulation.auto_scan_due(15 * 60));
         assert!(simulation.record_auto_signal("15m:123:LONG".to_owned()));
         assert!(!simulation.record_auto_signal("15m:123:LONG".to_owned()));
         assert_eq!(simulation.settings().margin_per_order, 250.0);
         assert_eq!(simulation.settings().leverage, 15);
+        assert_eq!(simulation.settings().max_loss_percent, 5.0);
     }
 }

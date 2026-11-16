@@ -66,18 +66,19 @@ type PaperAccount = {
   total_pnl: number
   margin_per_order: number
   leverage: number
+  max_loss_percent: number
   max_leverage: number
   auto_trade_enabled: boolean
-  scan_interval_minutes: number
   allow_multiple_positions: boolean
 }
 
 type PaperSettings = {
   margin_per_order: number
   leverage: number
+  max_loss_percent: number
   auto_trade_enabled: boolean
-  scan_interval_minutes: number
   allow_multiple_positions: boolean
+  analysis_timeframe: string
 }
 
 type PaperPosition = {
@@ -129,6 +130,7 @@ function App() {
   const [paperLoading, setPaperLoading] = useState(true)
   const [marginInput, setMarginInput] = useState('100')
   const [leverageInput, setLeverageInput] = useState('10')
+  const [maxLossInput, setMaxLossInput] = useState('5')
   const paperConfigInitialized = useRef(false)
   const [stopLossInput, setStopLossInput] = useState('')
   const [takeProfitInput, setTakeProfitInput] = useState('')
@@ -192,10 +194,14 @@ function App() {
       setPaperAccount(accountData.account as PaperAccount)
       setPaperPositions(positionsData.positions as PaperPosition[])
       setPaperTrades(tradesData.trades as ClosedPaperTrade[])
-      setPaperSettings(settingsData.settings as PaperSettings)
+      setPaperSettings({
+        ...settingsData.settings,
+        analysis_timeframe: settingsData.analysis_timeframe,
+      } as PaperSettings)
       if (!paperConfigInitialized.current) {
         setMarginInput(String(settingsData.settings.margin_per_order))
         setLeverageInput(String(settingsData.settings.leverage))
+        setMaxLossInput(String(settingsData.settings.max_loss_percent))
         paperConfigInitialized.current = true
       }
       setPaperError('')
@@ -223,6 +229,7 @@ function App() {
           take_profit: takeProfit,
           margin_amount: Number(marginInput),
           leverage: Number(leverageInput),
+          max_loss_percent: Number(maxLossInput),
         }),
       })
       const result = await response.json()
@@ -248,6 +255,7 @@ function App() {
         body: JSON.stringify({
           margin_per_order: Number(marginInput),
           leverage: Number(leverageInput),
+          max_loss_percent: Number(maxLossInput),
           auto_trade_enabled: enabled,
         }),
       })
@@ -255,9 +263,12 @@ function App() {
       if (!response.ok) {
         throw new Error(result.error ?? `Không lưu được cấu hình (HTTP ${response.status})`)
       }
-      setPaperSettings(result.settings as PaperSettings)
+      setPaperSettings({
+        ...result.settings,
+        analysis_timeframe: result.analysis_timeframe,
+      } as PaperSettings)
       setPaperNotice(enabled
-        ? 'Đã bật AI tự phân tích và vào lệnh mô phỏng mỗi 15 phút.'
+        ? `Đã bật AI; phân tích sau mỗi nến ${result.analysis_timeframe} đóng và chỉ vào lệnh khi có tín hiệu.`
         : 'Đã tắt AI tự vào lệnh.')
       await refreshPaperTrading()
     } catch (error) {
@@ -300,7 +311,10 @@ function App() {
     Number(marginInput) > 0 &&
     Number.isInteger(Number(leverageInput)) &&
     Number(leverageInput) >= 1 &&
-    Number(leverageInput) <= (paperAccount?.max_leverage ?? 20)
+    Number(leverageInput) <= (paperAccount?.max_leverage ?? 20) &&
+    Number.isFinite(Number(maxLossInput)) &&
+    Number(maxLossInput) >= 0.1 &&
+    Number(maxLossInput) <= 100
   const validManualLevels =
     validOrderSettings &&
     Number.isFinite(Number(stopLossInput)) &&
@@ -469,7 +483,7 @@ function App() {
               </div>
               <div className="mt-5 space-y-3 border-t border-slate-800 pt-4">
                 <p className="text-sm font-medium text-slate-200">Vốn và đòn bẩy mỗi lệnh</p>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <label className="text-xs text-slate-400">
                     Tiền ký quỹ (USDT)
                     <input
@@ -493,9 +507,21 @@ function App() {
                       className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500"
                     />
                   </label>
+                  <label className="text-xs text-slate-400">
+                    Lỗ tối đa (% ký quỹ)
+                    <input
+                      type="number"
+                      min="0.1"
+                      max="100"
+                      step="0.1"
+                      value={maxLossInput}
+                      onChange={(event) => setMaxLossInput(event.target.value)}
+                      className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500"
+                    />
+                  </label>
                 </div>
                 <p className="text-xs text-slate-500">
-                  Mỗi lệnh dùng {marginInput || '0'} USDT ký quỹ × {leverageInput || '0'}x. AI tự quét mỗi 15 phút; có thể mở nhiều vị thế.
+                  Mỗi lệnh dùng {marginInput || '0'} USDT × {leverageInput || '0'}x; mức lỗ tối đa là {maxLossInput || '0'}% ký quỹ. Bot phân tích khi nến {paperSettings?.analysis_timeframe ?? '15m'} đóng.
                 </p>
                 <div className="grid grid-cols-2 gap-3">
                   <button
@@ -516,7 +542,7 @@ function App() {
                   </button>
                 </div>
                 <p className="text-xs text-slate-500">
-                  Khi bật, backend tự phân tích mỗi 15 phút. Nếu có tín hiệu LONG/SHORT, lệnh mô phỏng dùng giá OKX và mức SL/TP của AI. Tín hiệu lặp trên cùng nến không tạo lệnh trùng.
+                  Khi bật, AI chỉ phân tích nến đã đóng. Có tín hiệu LONG/SHORT thì mở lệnh mô phỏng; TP theo AI, còn điểm dừng lỗ là mức chặt hơn giữa SL của AI và giới hạn lỗ bạn đặt. Sau khi lệnh đóng, bot chờ nến đóng tiếp theo rồi phân tích lại. Có thể giữ nhiều vị thế.
                 </p>
                 <p className="border-t border-slate-800 pt-3 text-sm font-medium text-slate-200">Hoặc mở lệnh thủ công</p>
                 <div className="grid grid-cols-2 gap-3">
@@ -622,7 +648,14 @@ function App() {
           <Panel title="Hiệu suất tài khoản">
             <div className="space-y-4">
               <InfoRow label="Tổng lãi/lỗ" value={paperAccount ? formatMoney(paperAccount.total_pnl) : '—'} />
-              <InfoRow label="Số giao dịch đã đóng" value={paperTrades.length.toString()} />
+              <InfoRow label="Số lệnh đã vào" value={(paperTrades.length + paperPositions.length).toString()} />
+              <InfoRow label="Đã đóng / đang mở" value={`${paperTrades.length} / ${paperPositions.length}`} />
+              <InfoRow label="Lãi đã chốt" value={paperAccount ? formatMoney(paperAccount.realized_pnl) : '—'} />
+              <InfoRow label="Lãi/lỗ vị thế mở" value={paperAccount ? formatMoney(paperAccount.unrealized_pnl) : '—'} />
+              <InfoRow
+                label="Lệnh thắng / thua"
+                value={`${paperTrades.filter((trade) => trade.pnl > 0).length} / ${paperTrades.filter((trade) => trade.pnl < 0).length}`}
+              />
               <InfoRow
                 label="Tỷ lệ thắng"
                 value={paperTrades.length
@@ -646,7 +679,8 @@ function App() {
           <Panel title="Quy tắc mô phỏng">
             <div className="space-y-3 text-sm text-slate-300">
               <InfoRow label="Chế độ" value="Chỉ giao dịch mô phỏng" />
-              <InfoRow label="AI quét định kỳ" value={paperSettings?.auto_trade_enabled ? `Bật · mỗi ${paperSettings.scan_interval_minutes} phút` : 'Tắt'} />
+              <InfoRow label="AI tự giao dịch" value={paperSettings?.auto_trade_enabled ? `Bật · theo nến ${paperSettings.analysis_timeframe} đã đóng` : 'Tắt'} />
+              <InfoRow label="Lỗ tối đa mỗi lệnh" value={paperSettings ? `${paperSettings.max_loss_percent}% ký quỹ` : '—'} />
               <InfoRow label="Cho phép nhiều vị thế" value={paperSettings?.allow_multiple_positions ? 'Có' : 'Không'} />
               <InfoRow label="Múi giờ" value="Asia/Ho_Chi_Minh" />
             </div>
@@ -661,7 +695,7 @@ function App() {
                 <div key={trade.id} className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2">
                   <div>
                     <div className={`font-medium ${trade.direction === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {trade.direction} · {trade.close_reason === 'MANUAL' ? 'Đóng thủ công' : trade.close_reason === 'TAKE_PROFIT' ? 'Chốt lời' : 'Cắt lỗ'}
+                      {trade.direction} · {trade.close_reason === 'MANUAL' ? 'Đóng thủ công' : trade.close_reason === 'TAKE_PROFIT' ? 'Chốt lời' : trade.close_reason === 'MAX_LOSS' ? 'Chạm lỗ tối đa' : 'Cắt lỗ theo AI'}
                     </div>
                     <div className="text-xs text-slate-500">{new Date(trade.closed_at).toLocaleString('vi-VN')}</div>
                   </div>

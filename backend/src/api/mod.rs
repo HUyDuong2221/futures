@@ -170,7 +170,10 @@ async fn generate_ai_analysis(
         &state.settings.okx_instrument,
         timeframe,
     )
-    .await?;
+    .await?
+    .into_iter()
+    .filter(|candle| candle.confirmed)
+    .collect::<Vec<_>>();
     if candles.len() < 30 {
         anyhow::bail!("Không đủ dữ liệu nến để phân tích.");
     }
@@ -212,7 +215,7 @@ async fn generate_ai_analysis(
         .ok_or_else(|| anyhow::anyhow!("Không có nến mới nhất để định danh tín hiệu."))?
         .time;
     Ok(GeneratedAnalysis {
-        signal_key: format!("{timeframe}:{latest_candle_time}:{}", decision.decision),
+        signal_key: format!("{timeframe}:{latest_candle_time}"),
         decision,
         symbol: state.settings.okx_instrument.clone(),
         model: state.settings.gemini_model.clone(),
@@ -221,9 +224,14 @@ async fn generate_ai_analysis(
 }
 
 pub async fn run_auto_paper_cycle(state: &AppState) {
+    let timeframe = state.settings.analysis_timeframe.as_str();
+    let Some(timeframe_seconds) = crate::market::timeframe_seconds(timeframe) else {
+        tracing::error!("Unsupported automatic analysis timeframe: {timeframe}");
+        return;
+    };
     let auto_settings = {
         let mut paper = state.paper.lock().await;
-        if paper.auto_scan_due() {
+        if paper.auto_scan_due(timeframe_seconds) {
             Some(paper.settings().clone())
         } else {
             None
@@ -242,7 +250,6 @@ pub async fn run_auto_paper_cycle(state: &AppState) {
         return;
     }
 
-    let timeframe = state.settings.analysis_timeframe.as_str();
     let analysis = match generate_ai_analysis(state, timeframe).await {
         Ok(analysis) => analysis,
         Err(error) => {
@@ -250,6 +257,11 @@ pub async fn run_auto_paper_cycle(state: &AppState) {
             return;
         }
     };
+    let mut paper = state.paper.lock().await;
+    if !paper.record_auto_signal(analysis.signal_key) {
+        tracing::info!("Skipped duplicate automatic analysis for a closed candle");
+        return;
+    }
     if !matches!(analysis.decision.decision.as_str(), "LONG" | "SHORT") {
         tracing::info!(
             "Automatic paper scan returned WAIT for {}",
@@ -257,6 +269,7 @@ pub async fn run_auto_paper_cycle(state: &AppState) {
         );
         return;
     }
+    drop(paper);
 
     let ticker = match crate::market::fetch_okx_ticker(
         &state.http,
@@ -279,16 +292,13 @@ pub async fn run_auto_paper_cycle(state: &AppState) {
     if !auto_settings.allow_multiple_positions && !paper.positions().is_empty() {
         return;
     }
-    if !paper.record_auto_signal(analysis.signal_key) {
-        tracing::info!("Skipped duplicate automatic paper signal");
-        return;
-    }
     let request = crate::simulation::paper::PaperOrderRequest {
         direction: analysis.decision.decision,
         stop_loss: analysis.decision.stop_loss,
         take_profit: analysis.decision.take_profit,
         margin_amount: paper.settings().margin_per_order,
         leverage: paper.settings().leverage,
+        max_loss_percent: auto_settings.max_loss_percent,
     };
     match paper.open_position(request, ticker.last_price, state.settings.max_leverage) {
         Ok(position) => tracing::info!(
@@ -435,7 +445,10 @@ async fn create_paper_order(
 
 async fn simulation_settings(State(state): State<AppState>) -> Json<Value> {
     let paper = state.paper.lock().await;
-    Json(json!({ "settings": paper.settings() }))
+    Json(json!({
+        "settings": paper.settings(),
+        "analysis_timeframe": state.settings.analysis_timeframe,
+    }))
 }
 
 async fn update_simulation_settings(
@@ -464,7 +477,10 @@ async fn update_simulation_settings(
                 Json(json!({ "error": error.to_string() })),
             )
         })?;
-    Ok(Json(json!({ "settings": paper.settings() })))
+    Ok(Json(json!({
+        "settings": paper.settings(),
+        "analysis_timeframe": state.settings.analysis_timeframe,
+    })))
 }
 
 async fn close_paper_position(
@@ -504,6 +520,7 @@ async fn performance_summary(State(state): State<AppState>) -> Result<Json<Value
     let paper = state.paper.lock().await;
     let trades = paper.trades();
     let wins = trades.iter().filter(|trade| trade.pnl > 0.0).count();
+    let losses = trades.iter().filter(|trade| trade.pnl < 0.0).count();
     let win_rate = if trades.is_empty() {
         0.0
     } else {
@@ -511,7 +528,10 @@ async fn performance_summary(State(state): State<AppState>) -> Result<Json<Value
     };
     let account = paper.summary(state.settings.max_leverage);
     Ok(Json(json!({
-        "total_trades": trades.len(),
+        "total_trades": trades.len() + paper.positions().len(),
+        "closed_trades": trades.len(),
+        "winning_trades": wins,
+        "losing_trades": losses,
         "win_rate": win_rate,
         "net_pnl": account.total_pnl,
         "realized_pnl": account.realized_pnl,
