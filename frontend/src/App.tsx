@@ -8,7 +8,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080').replace(/\/$/, '')
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 const TIMEFRAMES = ['1m', '5m', '15m', '1H', '4H', '1D'] as const
 
 type MarketData = {

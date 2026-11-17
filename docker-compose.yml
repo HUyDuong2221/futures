@@ -63,15 +63,13 @@ services:
       dockerfile: Dockerfile
     container_name: btc-frontend
     restart: unless-stopped
-    environment:
-      VITE_API_BASE_URL: http://btc-backend:8080
     depends_on:
       btc-backend:
         condition: service_started
     ports:
-      - "5173:5173"
+      - "5173:80"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5173"]
+      test: ["CMD", "wget", "-qO-", "http://localhost"]
       interval: 15s
       timeout: 5s
       retries: 10
